@@ -1,0 +1,46 @@
+syntax = "proto3";
+
+package graceful.v1;
+
+option go_package = "github.com/museop/graceful-shutdown/gen/graceful/v1;gracefulv1";
+
+// ServiceStatus is the lifecycle state published to clients.
+enum ServiceStatus {
+  SERVICE_STATUS_UNSPECIFIED = 0;
+  // SERVING means the server is healthy and should receive new client work.
+  SERVICE_STATUS_SERVING = 1;
+  // DRAINING means clients should stop choosing this server for new work, but
+  // the server still accepts work that arrives during the drain window.
+  SERVICE_STATUS_DRAINING = 2;
+  // GRACEFUL_SHUTDOWN means no new work should be accepted. Work already being
+  // processed is allowed to complete before process exit.
+  SERVICE_STATUS_GRACEFUL_SHUTDOWN = 3;
+}
+
+message WatchStatusRequest {
+  string client_id = 1;
+}
+
+message StatusUpdate {
+  string server_id = 1;
+  ServiceStatus status = 2;
+  int64 unix_millis = 3;
+}
+
+message WorkRequest {
+  string request_id = 1;
+  bytes payload = 2;
+  int32 delay_millis = 3;
+}
+
+message WorkResponse {
+  string request_id = 1;
+  bytes payload = 2;
+  string server_id = 3;
+  ServiceStatus observed_status = 4;
+}
+
+service GracefulService {
+  rpc WatchStatus(WatchStatusRequest) returns (stream StatusUpdate);
+  rpc Work(stream WorkRequest) returns (stream WorkResponse);
+}
