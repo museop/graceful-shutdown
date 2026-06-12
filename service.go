@@ -20,15 +20,31 @@ type WorkHandler func(context.Context, *gracefulv1.WorkRequest) ([]byte, error)
 
 type Service struct {
 	gracefulv1.UnimplementedGracefulServiceServer
-	lifecycle  *Lifecycle
-	handleWork WorkHandler
+	lifecycle         *Lifecycle
+	handleWork        WorkHandler
+	heartbeatInterval time.Duration
 }
 
 func NewService(lifecycle *Lifecycle, handleWork WorkHandler) *Service {
+	return NewServiceWithOptions(lifecycle, handleWork, ServiceOptions{})
+}
+
+type ServiceOptions struct {
+	// StatusHeartbeatInterval controls how often WatchStatus repeats the
+	// current state even when no lifecycle transition occurs. Repeating the
+	// state prevents missed updates from leaving clients stale and keeps quiet
+	// streams active through middleboxes.
+	StatusHeartbeatInterval time.Duration
+}
+
+func NewServiceWithOptions(lifecycle *Lifecycle, handleWork WorkHandler, options ServiceOptions) *Service {
 	if handleWork == nil {
 		handleWork = EchoWorkHandler
 	}
-	return &Service{lifecycle: lifecycle, handleWork: handleWork}
+	if options.StatusHeartbeatInterval <= 0 {
+		options.StatusHeartbeatInterval = time.Second
+	}
+	return &Service{lifecycle: lifecycle, handleWork: handleWork, heartbeatInterval: options.StatusHeartbeatInterval}
 }
 
 func EchoWorkHandler(ctx context.Context, req *gracefulv1.WorkRequest) ([]byte, error) {
@@ -49,17 +65,22 @@ func (s *Service) WatchStatus(_ *gracefulv1.WatchStatusRequest, stream gracefulv
 	current, updates, unsubscribe := s.lifecycle.subscribe()
 	defer unsubscribe()
 
+	heartbeat := time.NewTicker(s.heartbeatInterval)
+	defer heartbeat.Stop()
+
 	for {
 		if err := stream.Send(s.statusUpdate(current)); err != nil {
 			return err
 		}
-		if current == gracefulv1.ServiceStatus_SERVICE_STATUS_GRACEFUL_SHUTDOWN {
+		if current == gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING {
 			return nil
 		}
 
 		select {
 		case next := <-updates:
 			current = next
+		case <-heartbeat.C:
+			current = s.lifecycle.Status()
 		case <-stream.Context().Done():
 			return nil
 		}
@@ -68,7 +89,7 @@ func (s *Service) WatchStatus(_ *gracefulv1.WatchStatusRequest, stream gracefulv
 
 func (s *Service) Work(stream gracefulv1.GracefulService_WorkServer) error {
 	for {
-		if s.lifecycle.Status() == gracefulv1.ServiceStatus_SERVICE_STATUS_GRACEFUL_SHUTDOWN {
+		if s.lifecycle.Status() == gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING {
 			return status.Error(codes.Unavailable, ErrServerGracefulShutdown.Error())
 		}
 

@@ -9,7 +9,7 @@ A client keeps streaming service-state updates from servers A, B, and C while co
 1. A immediately publishes `DRAINING` on the status stream.
 2. Clients stop selecting A for new work after receiving `DRAINING`.
 3. A still handles work that arrives during the drain window.
-4. After `N` seconds, A publishes `GRACEFUL_SHUTDOWN`.
+4. A publishes `STOPPING` after either five continuous seconds with zero active connections or the configured maximum drain duration `N`.
 5. A stops accepting new RPCs but lets already-processing requests complete.
 6. A exits after in-flight work is done, while client work continues on B and C.
 
@@ -23,12 +23,12 @@ Service states:
 | --- | --- |
 | `SERVICE_STATUS_SERVING` | Healthy backend. Clients may route new work here. |
 | `SERVICE_STATUS_DRAINING` | Backend is being removed. Clients should not choose it for new work, but the server still accepts requests that arrive during the drain window. |
-| `SERVICE_STATUS_GRACEFUL_SHUTDOWN` | Backend no longer accepts new work. Existing in-flight work may complete. |
+| `SERVICE_STATUS_STOPPING` | Backend no longer accepts new work. Existing in-flight work may complete. |
 
 RPCs:
 
 - `WatchStatus(WatchStatusRequest) returns (stream StatusUpdate)`
-  - Sends the current status immediately and then every state transition.
+  - Sends the current status immediately, every state transition, and periodic repeats of the current state to avoid missed updates and quiet-stream disconnects.
 - `Work(stream WorkRequest) returns (stream WorkResponse)`
   - Demo bidirectional stream RPC for work.
   - Each accepted work item reports the server ID and status observed at admission time.
@@ -39,15 +39,15 @@ RPCs:
   - Owns the server status, broadcasts status updates, and tracks active work items.
 - [`service.go`](service.go)
   - Implements `WatchStatus` and `Work`.
-  - Rejects work after `GRACEFUL_SHUTDOWN`.
+  - Rejects work after `STOPPING`.
   - Interrupts idle work streams when graceful shutdown begins so shutdown cannot hang forever on a stream that is open but not sending messages.
 - [`shutdown.go`](shutdown.go)
   - Implements the shutdown sequence:
     1. set `DRAINING`,
-    2. wait `drainDelay`,
-    3. set `GRACEFUL_SHUTDOWN`,
-    4. call `grpc.Server.GracefulStop`,
-    5. force `Stop` only if the shutdown context expires.
+    2. wait until connections are zero for 5 seconds or `drain-timeout` elapses,
+    3. set `STOPPING`,
+    4. call `grpc.Server.GracefulStop`.
+  - It intentionally does not force-kill a stuck process; that is left to systemd, a container runtime, or another supervisor.
 - [`cmd/server`](cmd/server)
   - Runs one gRPC backend and handles `SIGINT`/`SIGTERM`.
 - [`cmd/client`](cmd/client)
@@ -74,9 +74,9 @@ go test -race ./...
 Start three servers:
 
 ```bash
-go run ./cmd/server -addr :50051 -server-id A -drain-delay 5s
-go run ./cmd/server -addr :50052 -server-id B -drain-delay 5s
-go run ./cmd/server -addr :50053 -server-id C -drain-delay 5s
+go run ./cmd/server -addr :50051 -server-id A -drain-timeout 30s
+go run ./cmd/server -addr :50052 -server-id B -drain-timeout 30s
+go run ./cmd/server -addr :50053 -server-id C -drain-timeout 30s
 ```
 
 Start a client:
@@ -104,13 +104,13 @@ The script:
 2. starts servers A, B, and C on free local ports,
 3. starts the load-generating client,
 4. sends `SIGINT` to server A,
-5. checks that A publishes `DRAINING` and `GRACEFUL_SHUTDOWN`,
+5. checks that A publishes `DRAINING` and `STOPPING`,
 6. checks that no client work is routed to A after the client observes A as `DRAINING`.
 
 Useful environment variables:
 
 ```bash
-DRAIN_DELAY=2s CLIENT_DURATION=9s CONCURRENCY=6 INTERVAL=100ms ./scripts/demo-graceful-shutdown.sh
+DRAIN_TIMEOUT=2s CLIENT_DURATION=9s CONCURRENCY=6 INTERVAL=100ms ./scripts/demo-graceful-shutdown.sh
 ```
 
 The script prints the temporary log directory. Set `KEEP_LOGS=1` to keep logs after success:

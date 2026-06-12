@@ -19,8 +19,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":50051", "listen address")
 	serverID := flag.String("server-id", hostname(), "server id published to clients")
-	drainDelay := flag.Duration("drain-delay", 5*time.Second, "time to remain in DRAINING before GRACEFUL_SHUTDOWN")
-	shutdownTimeout := flag.Duration("shutdown-timeout", 30*time.Second, "maximum time to wait for graceful stop before force stop")
+	drainTimeout := flag.Duration("drain-timeout", 30*time.Second, "maximum time to remain in DRAINING before STOPPING")
 	flag.Parse()
 
 	listener, err := net.Listen("tcp", *addr)
@@ -29,7 +28,7 @@ func main() {
 	}
 
 	lifecycle := gracefulshutdown.NewLifecycle(*serverID)
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.StatsHandler(lifecycle))
 	gracefulv1.RegisterGracefulServiceServer(grpcServer, gracefulshutdown.NewService(lifecycle, nil))
 
 	serveErr := make(chan error, 1)
@@ -43,7 +42,7 @@ func main() {
 
 	select {
 	case <-signalCtx.Done():
-		log.Printf("signal received: publishing DRAINING for %s", *drainDelay)
+		log.Printf("signal received: publishing DRAINING for up to %s", *drainTimeout)
 	case err := <-serveErr:
 		if err != nil {
 			log.Fatalf("grpc serve: %v", err)
@@ -51,10 +50,8 @@ func main() {
 		return
 	}
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), *shutdownTimeout)
-	defer cancel()
-	if err := gracefulshutdown.GracefulShutdown(shutdownCtx, grpcServer, lifecycle, *drainDelay); err != nil {
-		log.Printf("shutdown completed with force stop: %v", err)
+	if err := gracefulshutdown.GracefulShutdown(context.Background(), grpcServer, lifecycle, *drainTimeout); err != nil {
+		log.Printf("shutdown completed after interrupted drain: %v", err)
 	} else {
 		log.Printf("shutdown completed gracefully")
 	}

@@ -25,6 +25,10 @@ type testServer struct {
 }
 
 func startTestServer(t *testing.T, handle WorkHandler) *testServer {
+	return startTestServerWithOptions(t, handle, ServiceOptions{})
+}
+
+func startTestServerWithOptions(t *testing.T, handle WorkHandler, options ServiceOptions) *testServer {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -33,8 +37,8 @@ func startTestServer(t *testing.T, handle WorkHandler) *testServer {
 	}
 
 	lifecycle := NewLifecycle("server-a")
-	grpcServer := grpc.NewServer()
-	gracefulv1.RegisterGracefulServiceServer(grpcServer, NewService(lifecycle, handle))
+	grpcServer := grpc.NewServer(grpc.StatsHandler(lifecycle))
+	gracefulv1.RegisterGracefulServiceServer(grpcServer, NewServiceWithOptions(lifecycle, handle, options))
 
 	done := make(chan error, 1)
 	go func() {
@@ -63,7 +67,7 @@ func startTestServer(t *testing.T, handle WorkHandler) *testServer {
 	}
 }
 
-func TestWatchStatusReceivesDrainingThenGracefulShutdown(t *testing.T) {
+func TestWatchStatusReceivesDrainingThenStopping(t *testing.T) {
 	ts := startTestServer(t, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -80,19 +84,42 @@ func TestWatchStatusReceivesDrainingThenGracefulShutdown(t *testing.T) {
 	go func() {
 		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer shutdownCancel()
-		shutdownErr <- GracefulShutdown(shutdownCtx, ts.grpcServer, ts.lifecycle, 20*time.Millisecond)
+		shutdownErr <- GracefulShutdownWithOptions(shutdownCtx, ts.grpcServer, ts.lifecycle, ShutdownOptions{
+			MaxDrainDuration:        20 * time.Millisecond,
+			ConnectionCheckInterval: 5 * time.Millisecond,
+			ZeroConnectionsDuration: time.Second,
+		})
 	}()
 
 	assertStatus(t, stream, gracefulv1.ServiceStatus_SERVICE_STATUS_DRAINING)
-	assertStatus(t, stream, gracefulv1.ServiceStatus_SERVICE_STATUS_GRACEFUL_SHUTDOWN)
+	assertStatus(t, stream, gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING)
 
 	_, err = stream.Recv()
 	if !errors.Is(err, io.EOF) {
-		t.Fatalf("expected status stream EOF after GRACEFUL_SHUTDOWN, got %v", err)
+		t.Fatalf("expected status stream EOF after STOPPING, got %v", err)
 	}
 
 	if err := <-shutdownErr; err != nil {
 		t.Fatalf("GracefulShutdown: %v", err)
+	}
+}
+
+func TestWatchStatusRepeatsCurrentStatusPeriodically(t *testing.T) {
+	ts := startTestServerWithOptions(t, nil, ServiceOptions{StatusHeartbeatInterval: 10 * time.Millisecond})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := ts.client.WatchStatus(ctx, &gracefulv1.WatchStatusRequest{ClientId: "test-client"})
+	if err != nil {
+		t.Fatalf("WatchStatus: %v", err)
+	}
+
+	first := recvStatus(t, stream, gracefulv1.ServiceStatus_SERVICE_STATUS_SERVING)
+	second := recvStatus(t, stream, gracefulv1.ServiceStatus_SERVICE_STATUS_SERVING)
+
+	if second.GetUnixMillis() <= first.GetUnixMillis() {
+		t.Fatalf("periodic status unix_millis = %d, want greater than first %d", second.GetUnixMillis(), first.GetUnixMillis())
 	}
 }
 
@@ -163,7 +190,7 @@ func TestGracefulShutdownCompletesInFlightWorkBeforeStopping(t *testing.T) {
 	}
 }
 
-func TestWorkAcceptsDuringDrainingAndRejectsAfterGracefulShutdown(t *testing.T) {
+func TestWorkAcceptsDuringDrainingAndRejectsAfterStopping(t *testing.T) {
 	ts := startTestServer(t, nil)
 
 	ts.lifecycle.SetStatus(gracefulv1.ServiceStatus_SERVICE_STATUS_DRAINING)
@@ -172,7 +199,7 @@ func TestWorkAcceptsDuringDrainingAndRejectsAfterGracefulShutdown(t *testing.T) 
 		t.Fatalf("observed status = %s, want DRAINING", resp.GetObservedStatus())
 	}
 
-	ts.lifecycle.SetStatus(gracefulv1.ServiceStatus_SERVICE_STATUS_GRACEFUL_SHUTDOWN)
+	ts.lifecycle.SetStatus(gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING)
 	stream, err := ts.client.Work(context.Background())
 	if err != nil {
 		t.Fatalf("Work: %v", err)
@@ -182,7 +209,7 @@ func TestWorkAcceptsDuringDrainingAndRejectsAfterGracefulShutdown(t *testing.T) 
 	}
 	_, err = stream.Recv()
 	if status.Code(err) != codes.Unavailable {
-		t.Fatalf("expected Unavailable after GRACEFUL_SHUTDOWN, got %v", err)
+		t.Fatalf("expected Unavailable after STOPPING, got %v", err)
 	}
 }
 
@@ -214,6 +241,29 @@ func TestGracefulShutdownDoesNotHangOnIdleWorkStream(t *testing.T) {
 	}
 }
 
+func TestGracefulShutdownStopsAfterSustainedZeroConnections(t *testing.T) {
+	ts := startTestServer(t, nil)
+
+	started := time.Now()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer shutdownCancel()
+
+	if err := GracefulShutdownWithOptions(shutdownCtx, ts.grpcServer, ts.lifecycle, ShutdownOptions{
+		MaxDrainDuration:        time.Second,
+		ConnectionCheckInterval: 5 * time.Millisecond,
+		ZeroConnectionsDuration: 20 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("GracefulShutdownWithOptions: %v", err)
+	}
+
+	if elapsed := time.Since(started); elapsed >= 500*time.Millisecond {
+		t.Fatalf("shutdown elapsed = %s, want well before max drain duration", elapsed)
+	}
+	if got := ts.lifecycle.Status(); got != gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING {
+		t.Fatalf("status = %s, want STOPPING", got)
+	}
+}
+
 func sendOneWork(t *testing.T, client gracefulv1.GracefulServiceClient, requestID string) *gracefulv1.WorkResponse {
 	t.Helper()
 
@@ -240,6 +290,12 @@ func sendOneWork(t *testing.T, client gracefulv1.GracefulServiceClient, requestI
 func assertStatus(t *testing.T, stream gracefulv1.GracefulService_WatchStatusClient, want gracefulv1.ServiceStatus) {
 	t.Helper()
 
+	_ = recvStatus(t, stream, want)
+}
+
+func recvStatus(t *testing.T, stream gracefulv1.GracefulService_WatchStatusClient, want gracefulv1.ServiceStatus) *gracefulv1.StatusUpdate {
+	t.Helper()
+
 	update, err := stream.Recv()
 	if err != nil {
 		t.Fatalf("Recv status %s: %v", want, err)
@@ -247,4 +303,5 @@ func assertStatus(t *testing.T, stream gracefulv1.GracefulService_WatchStatusCli
 	if got := update.GetStatus(); got != want {
 		t.Fatalf("status = %s, want %s", got, want)
 	}
+	return update
 }

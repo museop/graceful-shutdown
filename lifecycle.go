@@ -6,6 +6,7 @@ import (
 	"time"
 
 	gracefulv1 "github.com/museop/graceful-shutdown/gen/graceful/v1"
+	"google.golang.org/grpc/stats"
 )
 
 // Lifecycle owns the server state that is published to status-stream clients and
@@ -16,6 +17,7 @@ type Lifecycle struct {
 	mu             sync.Mutex
 	status         gracefulv1.ServiceStatus
 	subscribers    map[chan gracefulv1.ServiceStatus]struct{}
+	activeConns    int
 	activeRequests int
 	gracefulDone   chan struct{}
 }
@@ -48,7 +50,7 @@ func (l *Lifecycle) SetStatus(next gracefulv1.ServiceStatus) {
 		return
 	}
 	l.status = next
-	if next == gracefulv1.ServiceStatus_SERVICE_STATUS_GRACEFUL_SHUTDOWN {
+	if next == gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING {
 		select {
 		case <-l.gracefulDone:
 		default:
@@ -100,13 +102,13 @@ func (l *Lifecycle) subscribe() (gracefulv1.ServiceStatus, <-chan gracefulv1.Ser
 }
 
 // TryBeginRequest reserves capacity for one work item unless the server has
-// already reached GRACEFUL_SHUTDOWN. The returned status is the state observed at
+// already reached STOPPING. The returned status is the state observed at
 // admission time and should be included in the response for traceability.
 func (l *Lifecycle) TryBeginRequest() (gracefulv1.ServiceStatus, func(), bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.status == gracefulv1.ServiceStatus_SERVICE_STATUS_GRACEFUL_SHUTDOWN {
+	if l.status == gracefulv1.ServiceStatus_SERVICE_STATUS_STOPPING {
 		return l.status, nil, false
 	}
 
@@ -120,11 +122,42 @@ func (l *Lifecycle) TryBeginRequest() (gracefulv1.ServiceStatus, func(), bool) {
 	return observed, done, true
 }
 
+func (l *Lifecycle) ActiveConnections() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.activeConns
+}
+
 func (l *Lifecycle) ActiveRequests() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.activeRequests
 }
+
+func (l *Lifecycle) TagConn(ctx context.Context, _ *stats.ConnTagInfo) context.Context {
+	return ctx
+}
+
+func (l *Lifecycle) HandleConn(_ context.Context, stat stats.ConnStats) {
+	switch stat.(type) {
+	case *stats.ConnBegin:
+		l.mu.Lock()
+		l.activeConns++
+		l.mu.Unlock()
+	case *stats.ConnEnd:
+		l.mu.Lock()
+		if l.activeConns > 0 {
+			l.activeConns--
+		}
+		l.mu.Unlock()
+	}
+}
+
+func (l *Lifecycle) TagRPC(ctx context.Context, _ *stats.RPCTagInfo) context.Context {
+	return ctx
+}
+
+func (l *Lifecycle) HandleRPC(context.Context, stats.RPCStats) {}
 
 // WaitForNoActiveRequests is useful for tests and for non-gRPC embedders that
 // want the same message-level completion guarantee as grpc.Server.GracefulStop.

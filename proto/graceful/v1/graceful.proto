@@ -12,9 +12,9 @@ enum ServiceStatus {
   // DRAINING means clients should stop choosing this server for new work, but
   // the server still accepts work that arrives during the drain window.
   SERVICE_STATUS_DRAINING = 2;
-  // GRACEFUL_SHUTDOWN means no new work should be accepted. Work already being
-  // processed is allowed to complete before process exit.
-  SERVICE_STATUS_GRACEFUL_SHUTDOWN = 3;
+  // STOPPING means the server is no longer accepting new work and is waiting
+  // for already-processing requests to complete before process exit.
+  SERVICE_STATUS_STOPPING = 3;
 }
 
 message WatchStatusRequest {

@@ -2,8 +2,7 @@
 set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DRAIN_DELAY="${DRAIN_DELAY:-2s}"
-SHUTDOWN_TIMEOUT="${SHUTDOWN_TIMEOUT:-10s}"
+DRAIN_TIMEOUT="${DRAIN_TIMEOUT:-2s}"
 CLIENT_DURATION="${CLIENT_DURATION:-9s}"
 CONCURRENCY="${CONCURRENCY:-6}"
 INTERVAL="${INTERVAL:-100ms}"
@@ -97,8 +96,7 @@ start_server() {
   "$BIN_DIR/server" \
     -addr "127.0.0.1:$port" \
     -server-id "$id" \
-    -drain-delay "$DRAIN_DELAY" \
-    -shutdown-timeout "$SHUTDOWN_TIMEOUT" \
+    -drain-timeout "$DRAIN_TIMEOUT" \
     >"$log_file" 2>&1 &
   local pid=$!
   PIDS+=("$pid")
@@ -110,9 +108,9 @@ assert_demo() {
   local client_log="$LOG_DIR/client.log"
   local server_a_log="$LOG_DIR/server-A.log"
 
-  log "asserting server A published DRAINING and GRACEFUL_SHUTDOWN"
+  log "asserting server A published DRAINING and STOPPING"
   grep -q '/A -> SERVICE_STATUS_DRAINING' "$client_log"
-  grep -q '/A -> SERVICE_STATUS_GRACEFUL_SHUTDOWN' "$client_log"
+  grep -q '/A -> SERVICE_STATUS_STOPPING' "$client_log"
   grep -q 'shutdown completed gracefully' "$server_a_log"
 
   local draining_line
@@ -170,7 +168,7 @@ main() {
   kill -INT "$PID_A"
 
   wait_for_log "$LOG_DIR/client.log" '/A -> SERVICE_STATUS_DRAINING' 5
-  wait_for_log "$LOG_DIR/client.log" '/A -> SERVICE_STATUS_GRACEFUL_SHUTDOWN' 8
+  wait_for_log "$LOG_DIR/client.log" '/A -> SERVICE_STATUS_STOPPING' 8
   wait_for_log "$LOG_DIR/server-A.log" 'shutdown completed gracefully' 8
 
   log "waiting for client to finish"
